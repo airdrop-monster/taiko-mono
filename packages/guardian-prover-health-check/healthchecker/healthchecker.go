@@ -40,7 +40,7 @@ func (h *HealthChecker) Close(ctx context.Context) {
 	h.cancelCtx()
 
 	if err := h.httpSrv.Shutdown(ctx); err != nil {
-		slog.Error("error encountered shutting down http server", "error", err)
+		slog.Error("error shutting down http server", "error", err)
 	}
 }
 
@@ -50,38 +50,63 @@ func (h *HealthChecker) InitFromCli(ctx context.Context, c *cli.Context) error {
 		return err
 	}
 
-	return InitFromConfig(ctx, h, cfg)
+	return h.initFromConfig(ctx, cfg)
 }
 
-func InitFromConfig(ctx context.Context, h *HealthChecker, cfg *Config) (err error) {
+func (h *HealthChecker) initFromConfig(ctx context.Context, cfg *Config) error {
 	db, err := cfg.OpenDBFunc()
 	if err != nil {
+		return fmt.Errorf("failed to open database: %w", err)
+	}
+
+	if err := h.setupRepositories(db); err != nil {
 		return err
 	}
 
+	if err := h.setupClients(cfg); err != nil {
+		return err
+	}
+
+	if err := h.setupGuardianProvers(); err != nil {
+		return err
+	}
+
+	h.httpPort = cfg.HTTPPort
+	h.ctx, h.cancelCtx = context.WithCancel(ctx)
+
+	return nil
+}
+
+func (h *HealthChecker) setupRepositories(db *sql.DB) error {
 	healthCheckRepo, err := repo.NewHealthCheckRepository(db)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to initialize HealthCheckRepository: %w", err)
 	}
 
 	signedBlockRepo, err := repo.NewSignedBlockRepository(db)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to initialize SignedBlockRepository: %w", err)
 	}
 
 	startupRepo, err := repo.NewStartupRepository(db)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to initialize StartupRepository: %w", err)
 	}
 
+	h.healthCheckRepo = healthCheckRepo
+
+	return nil
+}
+
+func (h *HealthChecker) setupClients(cfg *Config) error {
 	l1EthClient, err := ethclient.Dial(cfg.L1RPCUrl)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to connect to L1 Ethereum client: %w", err)
 	}
 
 	l2EthClient, err := ethclient.Dial(cfg.L2RPCUrl)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to connect to L2 Ethereum client: %w", err)
 	}
 
 	guardianProverContract, err := guardianprover.NewGuardianProver(
@@ -89,46 +114,64 @@ func InitFromConfig(ctx context.Context, h *HealthChecker, cfg *Config) (err err
 		l1EthClient,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to instantiate GuardianProver contract: %w", err)
 	}
 
-	numGuardians, err := guardianProverContract.NumGuardians(nil)
+	h.guardianProverContract = guardianProverContract
+
+	return nil
+}
+
+func (h *HealthChecker) setupGuardianProvers() error {
+	numGuardians, err := h.guardianProverContract.NumGuardians(nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get number of guardians: %w", err)
 	}
 
-	slog.Info("number of guardians", "numGuardians", numGuardians.Int64())
+	h.numGuardians = numGuardians.Uint64()
+	slog.Info("number of guardians", "numGuardians", h.numGuardians)
 
-	var guardianProvers []guardianproverhealthcheck.GuardianProver
-
-	for i := 0; i < int(numGuardians.Uint64()); i++ {
-		guardianAddress, err := guardianProverContract.Guardians(&bind.CallOpts{}, new(big.Int).SetInt64(int64(i)))
+	for i := 0; i < int(h.numGuardians); i++ {
+		guardianProver, err := h.createGuardianProver(i)
 		if err != nil {
 			return err
 		}
 
-		guardianId, err := guardianProverContract.GuardianIds(&bind.CallOpts{}, guardianAddress)
-		if err != nil {
-			return err
-		}
-
-		slog.Info("setting guardian prover address", "address", guardianAddress.Hex(), "id", guardianId.Uint64())
-
-		guardianProvers = append(guardianProvers, guardianproverhealthcheck.GuardianProver{
-			Address: guardianAddress,
-			ID:      new(big.Int).Sub(guardianId, common.Big1),
-			HealthCheckCounter: promauto.NewCounter(prometheus.CounterOpts{
-				Name: fmt.Sprintf("guardian_prover_%v_health_checks_ops_total", guardianId.Uint64()),
-				Help: "The total number of health checks",
-			}),
-			SignedBlockCounter: promauto.NewCounter(prometheus.CounterOpts{
-				Name: fmt.Sprintf("guardian_prover_%v_signed_block_ops_total", guardianId.Uint64()),
-				Help: "The total number of signed blocks",
-			}),
-		})
+		h.guardianProvers = append(h.guardianProvers, guardianProver)
 	}
 
-	h.httpSrv, err = hchttp.NewServer(hchttp.NewServerOpts{
+	return h.initializeHTTPServer()
+}
+
+func (h *HealthChecker) createGuardianProver(index int) (guardianproverhealthcheck.GuardianProver, error) {
+	guardianAddress, err := h.guardianProverContract.Guardians(&bind.CallOpts{}, new(big.Int).SetInt64(int64(index)))
+	if err != nil {
+		return guardianproverhealthcheck.GuardianProver{}, fmt.Errorf("failed to get guardian address at index %d: %w", index, err)
+	}
+
+	guardianId, err := h.guardianProverContract.GuardianIds(&bind.CallOpts{}, guardianAddress)
+	if err != nil {
+		return guardianproverhealthcheck.GuardianProver{}, fmt.Errorf("failed to get guardian ID for address %s: %w", guardianAddress.Hex(), err)
+	}
+
+	slog.Info("setting guardian prover address", "address", guardianAddress.Hex(), "id", guardianId.Uint64())
+
+	return guardianproverhealthcheck.GuardianProver{
+		Address: guardianAddress,
+		ID:      new(big.Int).Sub(guardianId, common.Big1),
+		HealthCheckCounter: promauto.NewCounter(prometheus.CounterOpts{
+			Name: fmt.Sprintf("guardian_prover_%v_health_checks_ops_total", guardianId.Uint64()),
+			Help: "The total number of health checks",
+		}),
+		SignedBlockCounter: promauto.NewCounter(prometheus.CounterOpts{
+			Name: fmt.Sprintf("guardian_prover_%v_signed_block_ops_total", guardianId.Uint64()),
+			Help: "The total number of signed blocks",
+		}),
+	}, nil
+}
+
+func (h *HealthChecker) initializeHTTPServer() error {
+	server, err := hchttp.NewServer(hchttp.NewServerOpts{
 		Echo:            echo.New(),
 		EthClient:       l2EthClient,
 		HealthCheckRepo: healthCheckRepo,
@@ -138,24 +181,17 @@ func InitFromConfig(ctx context.Context, h *HealthChecker, cfg *Config) (err err
 	})
 
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to initialize HTTP server: %w", err)
 	}
 
-	h.guardianProvers = guardianProvers
-	h.numGuardians = numGuardians.Uint64()
-	h.healthCheckRepo = healthCheckRepo
-	h.guardianProverContract = guardianProverContract
-	h.httpPort = cfg.HTTPPort
-
-	h.ctx, h.cancelCtx = context.WithCancel(ctx)
-
+	h.httpSrv = server
 	return nil
 }
 
 func (h *HealthChecker) Start() error {
 	go func() {
 		if err := h.httpSrv.Start(fmt.Sprintf(":%v", h.httpPort)); !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("Failed to start http server", "error", err)
+			slog.Error("failed to start HTTP server", "error", err)
 		}
 	}()
 
